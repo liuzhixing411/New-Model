@@ -1,0 +1,235 @@
+function [u_new, v_new, p_new] = Poisson(Fluid, grid, u_pred, v_pred)
+%% ========================================================================
+% Poisson: variable-coefficient incremental projection
+%
+% Solves pressure correction phi:
+%
+%   div( invrho_face * grad(phi) ) = div(u_pred) / dt
+%
+% Then corrects velocity:
+%
+%   u_new = u_pred - dt * invrho_x * d(phi)/dx
+%   v_new = v_pred - dt * invrho_y * d(phi)/dy
+%
+% Pressure update:
+%
+%   p_new = p_old + phi
+%
+% Efficiency modifications without changing algorithmic idea:
+%   1) RHS is vectorized.
+%   2) Face coefficients ae/aw/an/as/ap are precomputed.
+%   3) True Poisson residual is checked every N iterations instead of every iteration.
+%   4) Projection divergence after correction is computed only when verbose is enabled.
+%   5) Warning is issued if max_iter is reached before residual tolerance.
+%% ========================================================================
+
+start = grid.start;
+endy  = grid.endy;
+endx  = grid.endx;
+Ny    = grid.Ny;
+Nx    = grid.Nx;
+h     = grid.h;
+dt    = grid.dt;
+
+I = start:endx;
+J = start:endy;
+
+%% ---------------- unified face-centered 1/rho ----------------
+prop = compute_face_properties(Fluid, grid);
+invrho_x = prop.invrho_x;
+invrho_y = prop.invrho_y;
+
+%% ---------------- pressure correction phi ----------------
+phi = zeros(Ny, Nx);
+phi = apply_boundary_conditions('pressure', grid, phi);
+
+%% ---------------- RHS = div(u_pred) / dt ----------------
+rhs = zeros(Ny, Nx);
+
+rhs(J,I) = ( ...
+    (u_pred(J,I+1) - u_pred(J,I)) / h + ...
+    (v_pred(J+1,I) - v_pred(J,I)) / h ) / dt;
+
+% Compatibility condition for pure Neumann / periodic Poisson problem.
+rhs_mean = mean(rhs(J,I), 'all');
+rhs(J,I) = rhs(J,I) - rhs_mean;
+
+%% ---------------- SOR parameters ----------------
+max_iter = 80000;
+tol      = 1e-6;
+omega    = 1.75;
+
+% Residual check interval:
+% Larger value is faster but convergence detection is less frequent.
+res_check_interval = 20;
+
+if isfield(grid, 'poisson_max_iter')
+    max_iter = grid.poisson_max_iter;
+end
+
+if isfield(grid, 'poisson_tol')
+    tol = grid.poisson_tol;
+end
+
+if isfield(grid, 'poisson_omega')
+    omega = grid.poisson_omega;
+end
+
+if isfield(grid, 'poisson_res_check_interval')
+    res_check_interval = grid.poisson_res_check_interval;
+end
+
+res_check_interval = max(1, round(res_check_interval));
+
+%% ---------------- precompute Poisson coefficients ----------------
+% Local coefficient arrays are indexed by:
+%   jj = j - start + 1
+%   ii = i - start + 1
+
+ae_mat = invrho_x(J, I+1);
+aw_mat = invrho_x(J, I);
+an_mat = invrho_y(J+1, I);
+as_mat = invrho_y(J, I);
+
+ap_mat = ae_mat + aw_mat + an_mat + as_mat + 1e-30;
+
+rhs_loc = rhs(J,I);
+
+max_rhs = max(abs(rhs_loc), [], 'all') + 1e-30;
+
+%% ---------------- SOR solve for variable-coefficient Poisson ----------------
+res_norm   = inf;
+phi_change = NaN;
+converged  = false;
+last_checked_iter = 0;
+
+for iter = 1:max_iter
+
+    need_check = (mod(iter, res_check_interval) == 0) || (iter == 1) || (iter == max_iter);
+
+    if need_check
+        phi_old = phi;
+    end
+
+    phi = apply_boundary_conditions('pressure', grid, phi);
+
+    %% Gauss-Seidel / SOR update
+    for j = start:endy
+        jj = j - start + 1;
+
+        for i = start:endx
+            ii = i - start + 1;
+
+            ae = ae_mat(jj,ii);
+            aw = aw_mat(jj,ii);
+            an = an_mat(jj,ii);
+            as = as_mat(jj,ii);
+            ap = ap_mat(jj,ii);
+
+            % Discrete equation:
+            %
+            % [ae*(phi_E-phi_P) - aw*(phi_P-phi_W)
+            %  + an*(phi_N-phi_P) - as*(phi_P-phi_S)] / h^2 = rhs
+            %
+            % Therefore:
+            %
+            % phi_P =
+            % (ae*phi_E + aw*phi_W + an*phi_N + as*phi_S - rhs*h^2)/ap
+
+            phi_gs = ...
+                ( ae * phi(j,   i+1) + ...
+                  aw * phi(j,   i-1) + ...
+                  an * phi(j+1, i  ) + ...
+                  as * phi(j-1, i  ) - ...
+                  rhs(j,i) * h^2 ) / ap;
+
+            phi(j,i) = (1 - omega) * phi(j,i) + omega * phi_gs;
+        end
+    end
+
+    %% Gauge fixing: remove arbitrary constant
+    phi_mean = mean(phi(J,I), 'all');
+    phi(J,I) = phi(J,I) - phi_mean;
+
+    phi = apply_boundary_conditions('pressure', grid, phi);
+
+    %% True Poisson residual, checked only every res_check_interval iterations
+    if need_check
+
+        phi_change = max(abs(phi(J,I) - phi_old(J,I)), [], 'all');
+
+        max_res = 0;
+
+        for j = start:endy
+            jj = j - start + 1;
+
+            for i = start:endx
+                ii = i - start + 1;
+
+                ae = ae_mat(jj,ii);
+                aw = aw_mat(jj,ii);
+                an = an_mat(jj,ii);
+                as = as_mat(jj,ii);
+
+                Lphi = ...
+                    ( ae * (phi(j,   i+1) - phi(j,i)) ...
+                    - aw * (phi(j,i)     - phi(j,   i-1)) ...
+                    + an * (phi(j+1, i  ) - phi(j,i)) ...
+                    - as * (phi(j,i)     - phi(j-1, i  )) ) / h^2;
+
+                res = Lphi - rhs(j,i);
+                max_res = max(max_res, abs(res));
+            end
+        end
+
+        res_norm = max_res / max_rhs;
+        last_checked_iter = iter;
+
+        if res_norm < tol
+            converged = true;
+            break;
+        end
+    end
+end
+
+%% ---------------- warning if not converged ----------------
+if ~converged
+    warning(['Poisson SOR did not converge within max_iter = %d. ', ...
+             'Current checked residual = %.3e, target tol = %.3e, ', ...
+             'last checked iter = %d.'], ...
+             max_iter, res_norm, tol, last_checked_iter);
+end
+
+%% ---------------- velocity correction using same invrho faces ----------------
+u_new = u_pred;
+v_new = v_pred;
+
+Ju = start:endy+1;
+Iu = start:endx+1;
+
+u_new(Ju,Iu) = u_pred(Ju,Iu) - dt * invrho_x(Ju,Iu) .* ...
+    (phi(Ju,Iu) - phi(Ju,Iu-1)) / h;
+
+v_new(Ju,Iu) = v_pred(Ju,Iu) - dt * invrho_y(Ju,Iu) .* ...
+    (phi(Ju,Iu) - phi(Ju-1,Iu)) / h;
+
+[u_new, v_new] = apply_boundary_conditions('velocity', grid, u_new, v_new);
+
+%% ---------------- projection divergence check ----------------
+if isfield(grid, 'poisson_verbose') && grid.poisson_verbose
+
+    div_after = ...
+        (u_new(J,I+1) - u_new(J,I)) / h + ...
+        (v_new(J+1,I) - v_new(J,I)) / h;
+
+    max_div_after = max(abs(div_after), [], 'all');
+
+    fprintf('Poisson SOR: iter = %d, res_norm = %.3e, phi_change = %.3e, div_after = %.3e\n', ...
+        iter, res_norm, phi_change, max_div_after);
+end
+
+%% ---------------- update pressure ----------------
+p_new = Fluid.p + phi;
+p_new = apply_boundary_conditions('pressure', grid, p_new);
+
+end

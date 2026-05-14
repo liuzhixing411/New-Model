@@ -1,0 +1,17 @@
+function alpha_new = update_alpha(Fluid, Particle, grid)
+% =========================================================================
+% update_alpha
+%   1) pure advection     -> update_advection
+%   2) contact extension  -> update_extension
+%
+% Notes:
+%   This is the compatible implementation for your current framework:
+%       alpha  <-> gamma in the paper
+%   but the advection step is still your WENO split scheme, not Eq. (25)-(28).
+% =========================================================================
+
+% alpha_adv = update_advection(Fluid, grid);
+% alpha_new = update_extension(alpha_adv, Particle, grid);
+alpha_new = update_advection(Fluid, grid);
+
+end
