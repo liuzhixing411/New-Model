@@ -15,41 +15,63 @@ function Particle = update_particle_bubble_state(Fluid, Particle, grid)
 %   This function only detects whether a particle is close enough to the
 %   bubble interface and updates the particle-bubble interaction state.
 %
-% Definitions:
-%   h_geo   = geometrical gap between real particle surface and alpha=0.5
-%             bubble interface, searched along particle outward normals.
+% Distance definition used in this version:
 %
-%   delta_v = grid.virtual_film_thickness
+%   h_alpha:
+%       Minimum distance from real particle surface to current VOF interface
+%       band, using the same idea as the visualization label:
 %
-%   h_p_model = h_geo - delta_v
+%           alpha_low < alpha < alpha_high
 %
-% Interpretation:
-%   h_p_model < 0 means the real geometrical gap is smaller than the
-%   unresolved virtual film thickness. This is used as the numerical
-%   counterpart of the h_p < 0 criterion in the induction-stage model.
+%       By default:
 %
-% Required / suggested grid fields:
-%   grid.h
-%   grid.dt
-%   grid.Nx, grid.Ny
-%   grid.ghostnum
-%   grid.start, grid.endx, grid.endy
+%           alpha_low  = 0.05
+%           alpha_high = 0.95
+%
+%   delta_v:
+%       grid.virtual_film_thickness
+%
+%   h_p:
+%       h_p = h_alpha - delta_v
+%
+% Important:
+%   All state transitions in this function are based on h_p computed from
+%   h_alpha, not from ray-searched h_geo.
+%
+%   Therefore the state criterion is consistent with the visualization label:
+%
+%       FREE:
+%           h_p > h_c
+%
+%       COLLISION:
+%           0 < h_p <= h_c
+%
+%       INDUCTION:
+%           h_p <= 0
+%
+%       ATTACHMENT RELEASE:
+%           h_p > grid.virtual_release_thickness
+%
+% Note:
+%   This version intentionally keeps the original timer-reset behavior.
+%   If a particle enters induction but in the next step h_p no longer
+%   satisfies induction, the state is recomputed and the induction timer can
+%   be reset to zero.
 %
 % Optional grid fields:
-%   grid.enable_collision_state        default true
+%   grid.enable_collision_state        default false
 %   grid.enable_induction_state        default true
 %   grid.virtual_film_thickness        default 1.5*h
 %   grid.collision_hc_factor           default 0.2
 %   grid.virtual_release_thickness     default 2.5*h
-%   grid.pb_N_lag                      default 360
-%   grid.pb_search_ds_factor           default 0.25
-%   grid.pb_search_max_factor_h        default 8
-%   grid.pb_alpha_interface            default 0.5
+%   grid.pb_alpha_low                  default 0.05
+%   grid.pb_alpha_high                 default 0.95
 %   grid.induction_K                   default 1.0
 %   grid.induction_t_min               default 2*dt
 %   grid.induction_t_max               default 50*dt
 %   grid.local_Rb_min                  default 2*h
 %   grid.local_Rb_max_factor           default 1.0
+%   grid.debug_pb_state                default false
 %
 % Particle fields initialized / updated:
 %   Particle.pb_state
@@ -60,8 +82,9 @@ function Particle = update_particle_bubble_state(Fluid, Particle, grid)
 %   Particle.pb_contact_phi
 %   Particle.pb_contact_x
 %   Particle.pb_contact_y
-%   Particle.pb_hp_geo
-%   Particle.pb_hp_model
+%   Particle.pb_hp_geo       % kept for compatibility, here set equal to h_alpha
+%   Particle.pb_hp_alpha     % actual alpha-band distance used by this function
+%   Particle.pb_hp_model     % h_p = h_alpha - delta_v
 %
 % =========================================================================
 
@@ -121,68 +144,118 @@ if isfield(grid, 'induction_t_max')
     t_max = grid.induction_t_max;
 end
 
+debug_pb_state = false;
+if isfield(grid, 'debug_pb_state')
+    debug_pb_state = logical(grid.debug_pb_state);
+end
+
 %% ---------------- loop over particles ----------------
 for p = 1:Np
 
     old_state = Particle.pb_state(p);
 
     % ------------------------------------------------------------
-    % 1. Find geometrical particle-bubble gap using real alpha field
+    % 1. Find particle-bubble distance using alpha-band h_alpha
     % ------------------------------------------------------------
-    gap_info = find_particle_bubble_gap(alpha, Particle, p, grid);
+    gap_info = find_particle_bubble_gap_alpha(alpha, Particle, p, grid);
 
     if gap_info.found
-        h_geo   = gap_info.hp_geo;
-        h_model = h_geo - delta_v;
+        h_alpha = gap_info.hp_alpha;
+
+        % State-machine distance:
+        % This is the same definition as visualization:
+        %
+        %   h_p = gap_alpha - delta_v
+        %
+        h_p = h_alpha - delta_v;
     else
-        h_geo   = inf;
-        h_model = inf;
+        h_alpha = inf;
+        h_p     = inf;
     end
 
-    Particle.pb_hp_geo(p)   = h_geo;
-    Particle.pb_hp_model(p) = h_model;
+    % For compatibility with older post-processing:
+    %   pb_hp_geo is no longer ray-searched h_geo here.
+    %   It is set equal to h_alpha.
+    Particle.pb_hp_geo(p)   = h_alpha;
+    Particle.pb_hp_alpha(p) = h_alpha;
+    Particle.pb_hp_model(p) = h_p;
 
     Particle.pb_contact_phi(p) = gap_info.phi;
     Particle.pb_contact_x(p)   = gap_info.x_if;
     Particle.pb_contact_y(p)   = gap_info.y_if;
 
+    if debug_pb_state
+        fprintf(['[PB state check] p=%d, old_state=%d, found=%d, ', ...
+                 'h_alpha=%.3e m (%.2fh), h_p=%.3e m (%.2fh), ', ...
+                 'delta_v=%.2fh\n'], ...
+                 p, old_state, gap_info.found, ...
+                 h_alpha, h_alpha/h, ...
+                 h_p, h_p/h, ...
+                 delta_v/h);
+    end
+
     % ------------------------------------------------------------
     % 2. Attachment state has hysteresis / release condition
     % ------------------------------------------------------------
     if old_state == 3
-        if ~gap_info.found || h_model > release_thickness
+        if ~gap_info.found || h_p > release_thickness
             Particle.pb_state(p) = 0;
             Particle.virtual_contact_active(p) = false;
             Particle.induction_timer(p) = 0.0;
+
+            if debug_pb_state
+                fprintf(['[PB release] p=%d, old_state=3 -> FREE, ', ...
+                         'found=%d, h_p=%.3e m (%.2fh), ', ...
+                         'release=%.3e m (%.2fh)\n'], ...
+                         p, gap_info.found, ...
+                         h_p, h_p/h, ...
+                         release_thickness, release_thickness/h);
+            end
         else
             Particle.pb_state(p) = 3;
             Particle.virtual_contact_active(p) = true;
+
+            if debug_pb_state
+                fprintf(['[PB keep attachment] p=%d, h_p=%.3e m (%.2fh), ', ...
+                         'release=%.3e m (%.2fh)\n'], ...
+                         p, h_p, h_p/h, ...
+                         release_thickness, release_thickness/h);
+            end
         end
 
         continue;
     end
 
     % ------------------------------------------------------------
-    % 3. If no interface found nearby, reset to free
+    % 3. If no interface band found nearby, reset to free
     % ------------------------------------------------------------
     if ~gap_info.found
         Particle.pb_state(p) = 0;
         Particle.virtual_contact_active(p) = false;
         Particle.induction_timer(p) = 0.0;
+
+        if debug_pb_state
+            fprintf('[PB reset] p=%d, no alpha-band interface found -> FREE\n', p);
+        end
+
         continue;
     end
 
     % ------------------------------------------------------------
-    % 4. Determine candidate state from h_p_model
+    % 4. Determine candidate state from h_p based on h_alpha
+    %
+    %   free:      h_p > h_c
+    %   collision: 0 < h_p <= h_c
+    %   induction: h_p <= 0
     % ------------------------------------------------------------
     r_p = Particle.r(p);
     h_c = hc_factor * r_p;
 
-    if h_model > h_c
+    if h_p > h_c
 
         candidate_state = 0;   % free
 
-    elseif h_model > 0 && h_model <= h_c
+    elseif h_p > 0 && h_p <= h_c
 
         if enable_collision_state
             candidate_state = 1;   % collision
@@ -191,7 +264,7 @@ for p = 1:Np
         end
 
     else
-        % h_model <= 0
+        % h_p <= 0
         if enable_induction_state
             candidate_state = 2;   % induction
         else
@@ -199,8 +272,23 @@ for p = 1:Np
         end
     end
 
+    if debug_pb_state
+        fprintf(['[PB candidate] p=%d, h_p=%.3e m (%.2fh), ', ...
+                 'h_c=%.3e m (%.2fh), candidate_state=%d, ', ...
+                 'enable_collision=%d, enable_induction=%d\n'], ...
+                 p, h_p, h_p/h, ...
+                 h_c, h_c/h, ...
+                 candidate_state, ...
+                 enable_collision_state, enable_induction_state);
+    end
+
     % ------------------------------------------------------------
     % 5. State transition logic
+    %
+    % Important:
+    %   This keeps the original reset behavior.
+    %   If old_state == 2 but current h_p no longer gives candidate_state=2,
+    %   the timer will be reset in case 0 or case 1.
     % ------------------------------------------------------------
     switch candidate_state
 
@@ -210,13 +298,19 @@ for p = 1:Np
             Particle.virtual_contact_active(p) = false;
             Particle.induction_timer(p) = 0.0;
 
+            if debug_pb_state
+                fprintf('[PB transition] p=%d -> FREE, timer reset\n', p);
+            end
+
         case 1
             % collision
             Particle.pb_state(p) = 1;
             Particle.virtual_contact_active(p) = false;
-
-            % Keep timer at zero before induction.
             Particle.induction_timer(p) = 0.0;
+
+            if debug_pb_state
+                fprintf('[PB transition] p=%d -> COLLISION, timer reset\n', p);
+            end
 
         case 2
             % induction
@@ -229,20 +323,57 @@ for p = 1:Np
                 Rb_loc = estimate_local_bubble_radius(alpha, gap_info, grid);
                 Particle.Rb_induction(p) = Rb_loc;
 
-                ta = compute_induction_time(Rb_loc, r_p, grid);
-                ta = min(max(ta, t_min), t_max);
+                ta_raw = compute_induction_time(Rb_loc, r_p, grid);
+                ta = min(max(ta_raw, t_min), t_max);
                 Particle.ta_induction(p) = ta;
+
+                if debug_pb_state
+                    fprintf(['[PB enter induction] p=%d, h_p=%.3e m (%.2fh), ', ...
+                             'Rb=%.3e m, rp=%.3e m, ', ...
+                             'ta_raw=%.3e s, ta_clipped=%.3e s, ', ...
+                             't_min=%.3e s, t_max=%.3e s, dt=%.3e s\n'], ...
+                             p, h_p, h_p/h, ...
+                             Rb_loc, r_p, ...
+                             ta_raw, ta, ...
+                             t_min, t_max, dt);
+                end
             else
                 Particle.pb_state(p) = 2;
                 Particle.virtual_contact_active(p) = false;
+
+                if debug_pb_state
+                    fprintf(['[PB stay induction] p=%d, h_p=%.3e m (%.2fh), ', ...
+                             'timer=%.3e s, ta=%.3e s\n'], ...
+                             p, h_p, h_p/h, ...
+                             Particle.induction_timer(p), ...
+                             Particle.ta_induction(p));
+                end
             end
 
             % Count induction time.
             Particle.induction_timer(p) = Particle.induction_timer(p) + dt;
 
+            if debug_pb_state
+                fprintf(['[PB induction timer] p=%d, h_p=%.3e m (%.2fh), ', ...
+                         'timer=%.3e s / ta=%.3e s, dt=%.3e s\n'], ...
+                         p, h_p, h_p/h, ...
+                         Particle.induction_timer(p), ...
+                         Particle.ta_induction(p), ...
+                         dt);
+            end
+
             if Particle.induction_timer(p) >= Particle.ta_induction(p)
                 Particle.pb_state(p) = 3;
                 Particle.virtual_contact_active(p) = true;
+
+                if debug_pb_state
+                    fprintf(['[PB attachment] p=%d attached. ', ...
+                             'timer=%.3e s, ta=%.3e s, h_p=%.3e m (%.2fh)\n'], ...
+                             p, ...
+                             Particle.induction_timer(p), ...
+                             Particle.ta_induction(p), ...
+                             h_p, h_p/h);
+                end
             end
 
         case 3
@@ -258,31 +389,45 @@ for p = 1:Np
                 Particle.ta_induction(p) = compute_induction_time( ...
                     Particle.Rb_induction(p), r_p, grid);
             end
+
+            if debug_pb_state
+                fprintf(['[PB direct attachment] p=%d, h_p=%.3e m (%.2fh), ', ...
+                         'Rb=%.3e m, ta=%.3e s\n'], ...
+                         p, h_p, h_p/h, ...
+                         Particle.Rb_induction(p), ...
+                         Particle.ta_induction(p));
+            end
     end
 end
 
 end
 
 %% =========================================================================
-% Subfunction: find_particle_bubble_gap
+% Subfunction: find_particle_bubble_gap_alpha
 %% =========================================================================
-function info = find_particle_bubble_gap(alpha, Particle, p, grid)
+function info = find_particle_bubble_gap_alpha(alpha, Particle, p, grid)
 % =========================================================================
-% find_particle_bubble_gap
+% find_particle_bubble_gap_alpha
 %
-% Search alpha=0.5 interface along outward rays from particle surface.
+% Find the closest VOF interface-band cell to the particle surface.
 %
-% For each angular direction:
-%   x(s) = x_c + (r_p + s) * n
-%   y(s) = y_c + (r_p + s) * n
+% This is designed to match the visualization gap definition:
 %
-% where s >= 0 is the distance from the real particle surface.
+%   interface band:
+%       alpha_low < alpha < alpha_high
 %
-% The nearest alpha=0.5 crossing is returned as h_geo.
+%   h_alpha:
+%       min distance from particle surface to any interface-band cell center
 %
-% Output info:
+%       h_alpha = min( distance(cell_center, particle_center) - r_p )
+%
+% This does NOT search alpha=0.5 along rays. It uses the same alpha-band
+% standard as the label visualization.
+%
+% Output:
 %   info.found
-%   info.hp_geo
+%   info.hp_alpha
+%   info.hp_geo       % compatibility alias, set equal to hp_alpha
 %   info.phi
 %   info.normal
 %   info.x_if, info.y_if
@@ -291,35 +436,32 @@ function info = find_particle_bubble_gap(alpha, Particle, p, grid)
 % =========================================================================
 
 h        = grid.h;
-Ny       = grid.Ny;
-Nx       = grid.Nx;
+start    = grid.start;
+endy     = grid.endy;
+endx     = grid.endx;
 ghostnum = grid.ghostnum;
 
 x_c = Particle.x_c(p);
 y_c = Particle.y_c(p);
 r_p = Particle.r(p);
 
-N_lag = 360;
-if isfield(grid, 'pb_N_lag')
-    N_lag = grid.pb_N_lag;
-end
-
-alpha_if = 0.5;
-if isfield(grid, 'pb_alpha_interface')
-    alpha_if = grid.pb_alpha_interface;
-end
-
 delta_v = 1.5 * h;
 if isfield(grid, 'virtual_film_thickness')
     delta_v = grid.virtual_film_thickness;
 end
 
-ds_factor = 0.25;
-if isfield(grid, 'pb_search_ds_factor')
-    ds_factor = grid.pb_search_ds_factor;
+alpha_low = 0.05;
+if isfield(grid, 'pb_alpha_low')
+    alpha_low = grid.pb_alpha_low;
 end
-ds = ds_factor * h;
 
+alpha_high = 0.95;
+if isfield(grid, 'pb_alpha_high')
+    alpha_high = grid.pb_alpha_high;
+end
+
+% Optional local search radius to avoid scanning whole domain too heavily.
+% Keep large enough to cover near-field model range.
 search_max_factor_h = 8.0;
 if isfield(grid, 'pb_search_max_factor_h')
     search_max_factor_h = grid.pb_search_max_factor_h;
@@ -330,13 +472,11 @@ if isfield(grid, 'collision_hc_factor')
     hc_factor = grid.collision_hc_factor;
 end
 
-% Search distance should cover virtual film + collision range + buffer.
-s_max = max(search_max_factor_h * h, delta_v + hc_factor * r_p + 4*h);
-
-N_search = max(2, ceil(s_max / ds));
+search_radius = r_p + max(search_max_factor_h*h, delta_v + hc_factor*r_p + 4*h);
 
 % Initialize output.
 info.found      = false;
+info.hp_alpha   = inf;
 info.hp_geo     = inf;
 info.phi        = NaN;
 info.normal     = [NaN; NaN];
@@ -347,86 +487,65 @@ info.y_particle = NaN;
 info.x_virtual  = NaN;
 info.y_virtual  = NaN;
 
-best_s = inf;
+best_gap = inf;
 
-phi_list = linspace(0, 2*pi, N_lag+1);
-phi_list = phi_list(1:end-1);
+% Convert search box to index range.
+ic = round(x_c/h + ghostnum + 0.5);
+jc = round(y_c/h + ghostnum + 0.5);
 
-for k = 1:N_lag
+Rbox = ceil(search_radius / h) + 2;
 
-    phi = phi_list(k);
-    nvec = [cos(phi); sin(phi)];
+i1 = max(start, ic - Rbox);
+i2 = min(endx,  ic + Rbox);
+j1 = max(start, jc - Rbox);
+j2 = min(endy,  jc + Rbox);
 
-    % Values along the outward ray.
-    s_prev = 0.0;
-    x_prev = x_c + (r_p + s_prev) * nvec(1);
-    y_prev = y_c + (r_p + s_prev) * nvec(2);
+for j = j1:j2
+    y = (j - ghostnum - 0.5) * h;
 
-    a_prev = interp_cell_scalar_bilinear_local( ...
-        alpha, x_prev, y_prev, h, ghostnum, Ny, Nx);
+    for i = i1:i2
+        a = alpha(j,i);
 
-    % March outward.
-    for m = 1:N_search
-
-        s_curr = m * ds;
-
-        x_curr = x_c + (r_p + s_curr) * nvec(1);
-        y_curr = y_c + (r_p + s_curr) * nvec(2);
-
-        % If outside active computational domain, stop this ray.
-        if ~point_inside_active_domain(x_curr, y_curr, grid)
-            break;
+        if a <= alpha_low || a >= alpha_high
+            continue;
         end
 
-        a_curr = interp_cell_scalar_bilinear_local( ...
-            alpha, x_curr, y_curr, h, ghostnum, Ny, Nx);
+        x = (i - ghostnum - 0.5) * h;
 
-        f_prev = a_prev - alpha_if;
-        f_curr = a_curr - alpha_if;
+        dx = x - x_c;
+        dy = y - y_c;
 
-        % Detect crossing of alpha=0.5.
-        crossed = false;
+        rr = hypot(dx, dy);
 
-        if f_prev == 0
-            crossed = true;
-            lambda = 0.0;
-        elseif f_prev * f_curr < 0
-            crossed = true;
-            lambda = abs(f_prev) / (abs(f_prev) + abs(f_curr) + 1e-30);
-        elseif f_curr == 0
-            crossed = true;
-            lambda = 1.0;
-        else
-            lambda = NaN;
+        % Ignore invalid exactly-centered case.
+        if rr < 1e-30
+            continue;
         end
 
-        if crossed
-            s_if = (1 - lambda) * s_prev + lambda * s_curr;
+        gap = rr - r_p;
 
-            if s_if < best_s
-                best_s = s_if;
+        if gap < best_gap
+            best_gap = gap;
 
-                x_if = x_c + (r_p + s_if) * nvec(1);
-                y_if = y_c + (r_p + s_if) * nvec(2);
+            nx = dx / rr;
+            ny = dy / rr;
 
-                info.found      = true;
-                info.hp_geo     = s_if;
-                info.phi        = phi;
-                info.normal     = nvec;
-                info.x_if       = x_if;
-                info.y_if       = y_if;
-                info.x_particle = x_c + r_p * nvec(1);
-                info.y_particle = y_c + r_p * nvec(2);
-                info.x_virtual  = x_c + (r_p + delta_v) * nvec(1);
-                info.y_virtual  = y_c + (r_p + delta_v) * nvec(2);
-            end
+            info.found    = true;
+            info.hp_alpha = gap;
+            info.hp_geo   = gap;
 
-            % The first crossing along this ray is enough.
-            break;
+            info.phi    = atan2(ny, nx);
+            info.normal = [nx; ny];
+
+            info.x_if = x;
+            info.y_if = y;
+
+            info.x_particle = x_c + r_p * nx;
+            info.y_particle = y_c + r_p * ny;
+
+            info.x_virtual = x_c + (r_p + delta_v) * nx;
+            info.y_virtual = y_c + (r_p + delta_v) * ny;
         end
-
-        s_prev = s_curr;
-        a_prev = a_curr;
     end
 end
 
@@ -491,6 +610,12 @@ else
     Particle.pb_hp_geo = Particle.pb_hp_geo(:);
 end
 
+if ~isfield(Particle, 'pb_hp_alpha') || numel(Particle.pb_hp_alpha) ~= Np
+    Particle.pb_hp_alpha = inf(Np,1);
+else
+    Particle.pb_hp_alpha = Particle.pb_hp_alpha(:);
+end
+
 if ~isfield(Particle, 'pb_hp_model') || numel(Particle.pb_hp_model) ~= Np
     Particle.pb_hp_model = inf(Np,1);
 else
@@ -511,8 +636,6 @@ function Rb_loc = estimate_local_bubble_radius(alpha, gap_info, grid)
 %
 % Rb_loc = 1 / |kappa_loc|
 %
-% This is intentionally a simple and robust first version. The radius is
-% frozen at the moment of entering induction in the main state function.
 % =========================================================================
 
 h        = grid.h;
@@ -723,58 +846,5 @@ if isfield(grid, 'local_Rb_min')
 end
 
 Rb_equiv = max(Rb_equiv, Rb_min);
-
-end
-
-%% =========================================================================
-% Subfunction: bilinear interpolation of cell-centered scalar
-%% =========================================================================
-function val = interp_cell_scalar_bilinear_local(phi, xq, yq, h, ghostnum, Ny, Nx)
-
-i_idx = xq / h + 0.5 + ghostnum;
-j_idx = yq / h + 0.5 + ghostnum;
-
-i0 = floor(i_idx);
-j0 = floor(j_idx);
-i1 = i0 + 1;
-j1 = j0 + 1;
-
-i0 = max(1, min(i0, Nx));
-i1 = max(1, min(i1, Nx));
-j0 = max(1, min(j0, Ny));
-j1 = max(1, min(j1, Ny));
-
-dx = i_idx - i0;
-dy = j_idx - j0;
-
-dx = min(max(dx, 0.0), 1.0);
-dy = min(max(dy, 0.0), 1.0);
-
-val = (1-dx)*(1-dy)*phi(j0,i0) + ...
-       dx   *(1-dy)*phi(j0,i1) + ...
-      (1-dx)* dy   *phi(j1,i0) + ...
-       dx   * dy   *phi(j1,i1);
-
-val = min(max(val, 0.0), 1.0);
-
-end
-
-%% =========================================================================
-% Subfunction: active-domain check
-%% =========================================================================
-function tf = point_inside_active_domain(x, y, grid)
-
-h        = grid.h;
-ghostnum = grid.ghostnum;
-start    = grid.start;
-endy     = grid.endy;
-endx     = grid.endx;
-
-x_min = (start - ghostnum - 0.5)*h;
-x_max = (endx  - ghostnum - 0.5)*h;
-y_min = (start - ghostnum - 0.5)*h;
-y_max = (endy  - ghostnum - 0.5)*h;
-
-tf = (x >= x_min && x <= x_max && y >= y_min && y <= y_max);
 
 end
